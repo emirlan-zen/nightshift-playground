@@ -315,8 +315,8 @@ func TestMRRefsExtraction(t *testing.T) {
 		Notes: []ticketNote{
 			{Text: "opened https://gitlab.com/example-group/technology/example-repo/-/merge_requests/34 and gitlab.com/example-group/technology/example-repo/-/merge_requests/34 (dup)"},
 			{Text: "see also https://gitlab.com/example-group/technology/example-repo for context"}, // non-MR url ignored
-			{Text: "mirror at evil-gitlab.com/attacker/repo/-/merge_requests/1"},            // host-anchored: no match
-			{By: "janitor", Text: "auto-closed: … gitlab.com/g/p/-/merge_requests/3"},       // our own notes ignored
+			{Text: "mirror at evil-gitlab.com/attacker/repo/-/merge_requests/1"},                    // host-anchored: no match
+			{By: "janitor", Text: "auto-closed: … gitlab.com/g/p/-/merge_requests/3"},               // our own notes ignored
 		},
 	}
 	refs := mrRefs(tk)

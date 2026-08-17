@@ -114,7 +114,7 @@ func TestRefreshForgeStatuses(t *testing.T) {
 	authEnv(t, "agent-a", "agent-b", "playground", "agent-c")
 	codes := map[string]int{
 		"agent-a":    forgeOK,
-		"agent-b":     forgeDead,
+		"agent-b":    forgeDead,
 		"playground": forgeNotConf,
 		"agent-c":    forgeInconclusive,
 	}
@@ -132,7 +132,7 @@ func TestRefreshForgeStatuses(t *testing.T) {
 	}
 	want := map[string]bool{
 		"agent-a":    true,  // ok
-		"agent-b":     false, // dead token -> the ONLY alerting state
+		"agent-b":    false, // dead token -> the ONLY alerting state
 		"playground": true,  // not configured -> non-alerting
 		"agent-c":    true,  // inconclusive -> non-alerting
 	}
