@@ -280,7 +280,7 @@ test("a scheduled template wears its recurring badge in the studio", async ({ pa
 
 test("run detail shows the serialized concurrency chip", async ({ page }) => {
   await page.goto("/runs");
-  await page.getByText("Implement ADR-0056 progression approval end to end").first().click();
+  await page.getByText("Add a verified approval workflow").first().click();
   await expect(page.getByText(/serialized/i).first()).toBeVisible();
 });
 

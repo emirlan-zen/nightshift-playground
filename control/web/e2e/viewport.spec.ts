@@ -166,9 +166,11 @@ test("run detail and its /flows alias render and don't scroll at 390px", async (
   // offender before .flow-graph got an explicit width.
   await page.setViewportSize(PHONE);
   await page.goto("/runs", { waitUntil: "networkidle" });
-  await page.getByText("Implement ADR-0056 progression approval").first().click();
+  await page.getByText("Add a verified approval workflow").first().click();
   await expect(page).toHaveURL(/\/runs\/flow-/);
-  await expect(page.getByRole("heading", { name: /Implement ADR-0056/ })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /Add a verified approval workflow/ }),
+  ).toBeVisible();
   await page.waitForTimeout(300);
   await expectNoHorizontalScroll(page, "run detail");
 
@@ -176,7 +178,9 @@ test("run detail and its /flows alias render and don't scroll at 390px", async (
   const id = new URL(page.url()).pathname.split("/").pop()!;
   await page.goto(`/flows/${id}`, { waitUntil: "networkidle" });
   expect(new URL(page.url()).pathname).toBe(`/flows/${id}`);
-  await expect(page.getByRole("heading", { name: /Implement ADR-0056/ })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /Add a verified approval workflow/ }),
+  ).toBeVisible();
   await page.waitForTimeout(300);
   await expectNoHorizontalScroll(page, "run detail (/flows alias)");
 
