@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Agent-side, cwd-scoped flow/automation helper (ADR-0015, extended ADR-0019).
+# Agents inspect their own runs and steer them through a SPOOL — request files
+# under ~/.nightshift/flow-updates/<agent>/ that the control plane validates
+# and applies on its next tick. Agents never edit flow/job JSON directly (the
+# control plane owns that state; a direct write races its saves), and cannot
+# touch another agent's runs. Automation DEFINITIONS stay propose-only
+# (ADR-0017) — this tool creates and steers run INSTANCES only.
+set -euo pipefail
+
+ns="$HOME/.nightshift"
+root="$HOME/workspace/"
+case "$PWD/" in
+  "$root"*) rel="${PWD#"$root"}"; agent="${rel%%/*}" ;;
+  *) echo "nightshift-flow: refusing outside ~/workspace/<agent>/" >&2; exit 2 ;;
+esac
+case "$agent" in
+  playground) ;;
+  *) echo "nightshift-flow: unknown agent '$agent'" >&2; exit 2 ;;
+esac
+
+spool="$ns/flow-updates/$agent"
+
+# queue_request <name> <content-file>: atomic drop into the spool, then poll
+# the control plane's verdict — written as the request name with any .json
+# suffix replaced by .result (create-1.json -> create-1.result).
+queue_request() {
+  local name="$1" src="$2" res
+  res="${name%.json}.result"
+  mkdir -p "$spool"
+  rm -f "$spool/$res"
+  local tmp="$spool/$name.tmp.$$"
+  cp "$src" "$tmp"
+  mv "$tmp" "$spool/$name"
+  echo "queued: $name (control plane applies within ~30s)"
+  for _ in $(seq 1 40); do
+    if [[ -f "$spool/$res" ]]; then
+      cat "$spool/$res"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "no verdict yet — check later with: cat $spool/$res"
+}
+
+check_flow_id() {
+  [[ "$1" =~ ^flow-[0-9]{8}-[0-9]{4}-[a-f0-9]{8}$ ]] || { echo "bad flow id" >&2; exit 2; }
+  local flow="$ns/flows/$1.json"
+  [[ -f "$flow" ]] || { echo "flow not found" >&2; exit 2; }
+  [[ "$(jq -r '.agent' "$flow")" == "$agent" ]] || { echo "flow belongs to another agent" >&2; exit 2; }
+}
+
+verb="${1:-}"
+case "$verb" in
+  list)
+    shopt -s nullglob
+    for f in "$ns/flows"/*.json; do
+      jq -r --arg a "$agent" 'select(.agent==$a) | [.id,.status,.repo,(.deadline // "none"),.goal] | @tsv' "$f"
+    done
+    ;;
+  status)
+    id="${2:-}"; check_flow_id "$id"
+    flow="$ns/flows/$id.json"
+    jq -r '"id: \(.id)\nstatus: \(.status)\nrepo: \(.repo)\ngoal: \(.goal)\nbranch: \(.branch)\nworktree: \(.worktree)\nmaxConcurrent: \(.maxConcurrent // 1)\ndeadline: \(.deadline // "none")"' "$flow"
+    echo "nodes:"
+    while IFS=$'\t' read -r nid role jobid; do
+      state="pending"
+      [[ -f "$ns/reports/$agent/$jobid.md" ]] && state="delivered"
+      [[ -f "$ns/reports/$agent/$jobid.authfail" ]] && state="auth-skip"
+      [[ -f "$ns/reports/$agent/$jobid.depskip" ]] && state="dep-skip"
+      [[ -f "$ns/reports/$agent/$jobid.watchdog" ]] && state="watchdog-released"
+      echo "  $nid ($role) [$state] job=$jobid"
+    done < <(jq -r '.nodes[] | [.id,.role,.jobId] | @tsv' "$flow")
+    ;;
+  create)
+    # nightshift-flow create <repo> <template> <goal…>   (reads optional JSON
+    # overrides — acceptance/guidance/deadline/maxConcurrent/fastHandoff —
+    # from stdin when piped)
+    repo="${2:-}"; template="${3:-}"; shift 3 || true; goal="${*:-}"
+    [[ -n "$repo" && -n "$template" && -n "$goal" ]] || { echo "usage: nightshift-flow create <repo> <template> <goal…>  [extras JSON on stdin]" >&2; exit 2; }
+    extras="{}"
+    if [[ ! -t 0 ]]; then
+      extras="$(cat)"
+      [[ -z "$extras" ]] && extras="{}"
+      jq -e . >/dev/null 2>&1 <<<"$extras" || { echo "stdin extras must be valid JSON" >&2; exit 2; }
+    fi
+    nonce="$(date +%s)-$$"
+    tmp="$(mktemp)"
+    jq -n --arg repo "$repo" --arg template "$template" --arg goal "$goal" --argjson extras "$extras" \
+      '{repo:$repo, template:$template, goal:$goal} + $extras' > "$tmp"
+    queue_request "create-$nonce.json" "$tmp"
+    rm -f "$tmp"
+    ;;
+  append)
+    # nightshift-flow append <flow-id> <role> [role…] — sequential nodes onto
+    # the run's tail, inside the lifetime session budget. Nonce'd filename so
+    # concurrent sessions can't clobber each other's request or verdict.
+    id="${2:-}"; check_flow_id "$id"; shift 2
+    [[ $# -ge 1 ]] || { echo "usage: nightshift-flow append <flow-id> <role> [role…]" >&2; exit 2; }
+    tmp="$(mktemp)"
+    printf '%s\n' "$@" | jq -R . | jq -s '{roles: .}' > "$tmp"
+    queue_request "$id.append-$(date +%s)-$$.json" "$tmp"
+    rm -f "$tmp"
+    ;;
+  guidance)
+    # nightshift-flow guidance <flow-id> <text…> — replaces run guidance for
+    # UNSTARTED nodes only (started sessions keep their pinned prompt).
+    id="${2:-}"; check_flow_id "$id"; shift 2
+    [[ $# -ge 1 ]] || { echo "usage: nightshift-flow guidance <flow-id> <text…>" >&2; exit 2; }
+    tmp="$(mktemp)"
+    printf '%s' "$*" > "$tmp"
+    queue_request "$id.guidance-$(date +%s)-$$" "$tmp"
+    rm -f "$tmp"
+    ;;
+  deadline)
+    id="${2:-}"; value="${3:-}"
+    check_flow_id "$id"
+    if [[ "$value" != "none" ]]; then
+      # GNU date on the box validates + canonicalises any RFC3339 form.
+      value="$(date -u -d "$value" '+%Y-%m-%dT%H:%M:%SZ')" || { echo "bad RFC3339 deadline" >&2; exit 2; }
+      [[ "$(date -d "$value" +%s)" -gt "$(date -d '+10 minutes' +%s)" ]] || { echo "deadline must be >10m ahead" >&2; exit 2; }
+    fi
+    mkdir -p "$spool"
+    tmp="$spool/$id.deadline.tmp.$$"
+    printf '%s\n' "$value" > "$tmp"
+    mv "$tmp" "$spool/$id.deadline"
+    echo "deadline update queued: $id -> $value"
+    ;;
+  *)
+    cat >&2 <<'EOF'
+usage: nightshift-flow <verb>
+  list                              your runs (id, status, repo, deadline, goal)
+  status <flow-id>                  run detail + per-node state
+  create <repo> <template> <goal…>  start a run (extras JSON on stdin:
+                                    {"acceptance":[…],"guidance":"…","deadline":"RFC3339",
+                                     "maxConcurrent":N,"fastHandoff":true,"nodes":[…]})
+  append <flow-id> <role> [role…]   add nodes onto the run's tail (budget-capped)
+  guidance <flow-id> <text…>        update guidance for unstarted nodes
+  deadline <flow-id> <RFC3339|none> propose a deadline change
+EOF
+    exit 2
+    ;;
+esac

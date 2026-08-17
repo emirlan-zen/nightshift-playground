@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Agent-side ticketboard CLI. Installed as /usr/local/bin/nightshift-ticket.
+#
+# Tickets are per-agent JSON files under ~/.nightshift/tickets/<agent>/, shared
+# with the control plane. The
+# agent is derived from the workspace dir you're in — fails closed outside
+# ~/workspace/<agent>/, like the jira/gcloud wrappers, so an agent can only
+# touch its own board. Writes are rename-atomic (the control plane may read
+# concurrently). Agents create tickets and move open -> review. The steward wave
+# may also close a `review` ticket it can prove landed (ADR-0008) — the gate is
+# review-state + a non-empty evidence note, so an exec worker can't skip review.
+#
+#   nightshift-ticket create [--lane hunt|improve|ops] "<title>" ["<body>"|-]  # - = stdin body
+#   nightshift-ticket list [open|review|closed]
+#   nightshift-ticket show <id>
+#   nightshift-ticket claim <id> [<who>]              # lock an open ticket for a worker
+#   nightshift-ticket review <id> "<note>"            # open -> review, note required
+#   nightshift-ticket comment <id> "<note>"           # append a note, status unchanged
+#   nightshift-ticket close <id> "<evidence>"         # review -> closed, evidence required
+#                                                     # (steward only: PR merged + live + green)
+#
+# Claim locks: exec workers now pull MULTIPLE tickets per session, so concurrent
+# workers race for the same open ticket. `claim` is the race-free gate: the lock
+# is an O_EXCL sidecar `<id>.claim` (bash noclobber create — the real mutex); the
+# JSON claimedBy/claimedAt fields are informational. A FRESH sidecar (mtime < 8h)
+# blocks; a STALE one (>= 8h, a crashed worker) is stolen. review/close drop the
+# sidecar (ticket left the open pool); list marks fresh-claimed open tickets.
+#
+# Exit codes: 0 ok, 2 refused (outside workspace / bad id / illegal transition / claimed), 1 error.
+set -euo pipefail
+
+secrets="${NIGHTSHIFT_SECRETS_DIR:-/etc/nightshift/secrets}"
+ws="${HOME}/workspace"; agent=""
+case "${PWD}/" in "${ws}"/*) agent="${PWD#${ws}/}"; agent="${agent%%/*}";; esac
+if [ -z "$agent" ] || [ ! -f "${secrets}/${agent}.env" ]; then
+  echo "nightshift-ticket: refusing — run inside ~/workspace/<agent>/ (cwd=${PWD})" >&2
+  exit 2
+fi
+dir="${HOME}/.nightshift/tickets/${agent}"
+mkdir -p "$dir"
+
+need_id() {
+  if [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then return 0; fi
+  echo "nightshift-ticket: bad ticket id '$1'" >&2; exit 2
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+
+create)
+  lane=""
+  if [ "${1:-}" = "--lane" ]; then
+    lane="${2:-}"; shift 2 || true
+    case "$lane" in hunt|improve|ops) ;; *) echo "nightshift-ticket: --lane must be hunt|improve|ops" >&2; exit 2;; esac
+  fi
+  title="${1:-}"; body="${2:-}"
+  if [ -z "$title" ]; then echo "usage: nightshift-ticket create [--lane hunt|improve|ops] \"<title>\" [\"<body>\"|-]" >&2; exit 2; fi
+  if [ "$body" = "-" ]; then body="$(cat)"; fi
+  id="$(TZ=Asia/Bishkek date +%Y%m%d-%H%M)-tkt-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+  python3 - "$dir" "$id" "$agent" "$title" "$body" "$(now_utc)" "$lane" <<'PY'
+import json, os, sys
+d, tid, agent, title, body, now, lane = sys.argv[1:8]
+t = {"id": tid, "agent": agent, "title": title[:200], "body": body[:16384],
+     "status": "open", "createdBy": agent, "created": now, "updated": now, "notes": []}
+if lane:
+    t["lane"] = lane
+tmp = os.path.join(d, tid + ".json.tmp.%d" % os.getpid())
+with open(tmp, "w") as f:
+    json.dump(t, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, os.path.join(d, tid + ".json"))
+print(tid)
+PY
+  ;;
+
+list)
+  want="${1:-}"
+  python3 - "$dir" "$want" <<'PY'
+import glob, json, os, sys, time
+d, want = sys.argv[1], sys.argv[2]
+fresh = time.time() - 8 * 3600   # claim sidecar mtime newer than this = still held
+rows = []
+for p in glob.glob(os.path.join(d, "*.json")):
+    try:
+        with open(p) as f: t = json.load(f)
+    except Exception:
+        continue
+    st = t.get("status", "?")
+    if want and st != want: continue
+    claimed = False
+    if st == "open":
+        try:
+            claimed = os.path.getmtime(os.path.join(d, t.get("id", "") + ".claim")) >= fresh
+        except OSError:
+            pass
+    rows.append((t.get("created", ""), t.get("id", "?"), st, t.get("title", ""), claimed))
+for _, tid, st, title, claimed in sorted(rows):
+    print("%s  %-7s %s%s" % (tid, st, title, " [claimed]" if claimed else ""))
+PY
+  ;;
+
+show)
+  id="${1:-}"; need_id "$id"
+  f="${dir}/${id}.json"
+  if [ ! -f "$f" ]; then echo "nightshift-ticket: no such ticket ${id}" >&2; exit 1; fi
+  python3 - "$f" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f: t = json.load(f)
+print("%s  [%s]" % (t["id"], t["status"]))
+print("title:   " + t.get("title", ""))
+print("filed:   %s by %s" % (t.get("created", "?"), t.get("createdBy", "?")))
+if t.get("body"): print("\n" + t["body"])
+for n in t.get("notes", []):
+    print("\n-- %s (%s)\n%s" % (n.get("by", "?"), n.get("at", "?"), n.get("text", "")))
+PY
+  ;;
+
+claim)
+  # Lock an open ticket so concurrent exec workers don't double-work it. The lock
+  # is the O_EXCL sidecar create (bash noclobber = O_EXCL); the JSON fields are
+  # informational. Refuses on non-open ticket or a fresh (<8h) rival sidecar; a
+  # stale sidecar (>=8h, crashed worker) is stolen once.
+  id="${1:-}"; who="${2:-}"; need_id "$id"
+  f="${dir}/${id}.json"
+  if [ ! -f "$f" ]; then echo "nightshift-ticket: refusing — no such ticket ${id}" >&2; exit 2; fi
+  st="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$f" 2>/dev/null || true)"
+  if [ "$st" != "open" ]; then
+    echo "nightshift-ticket: refusing — ${id} is '${st:-?}', only open tickets can be claimed" >&2; exit 2
+  fi
+  who="${who:-$(hostname -s 2>/dev/null || echo agent)-$$}"; who="${who:0:120}"
+  claim="${dir}/${id}.claim"
+  stale=$(( $(date +%s) - 8 * 3600 ))   # sidecar mtime <= this = crashed worker, steal it
+  try_lock() { ( set -C; : > "$claim" ) 2>/dev/null; }   # noclobber = O_EXCL create
+  if ! try_lock; then
+    mt="$(stat -c %Y "$claim" 2>/dev/null || stat -f %m "$claim" 2>/dev/null || echo 0)"
+    if [ "$mt" -gt "$stale" ]; then
+      echo "nightshift-ticket: refusing — ${id} already claimed (fresh lock)" >&2; exit 2
+    fi
+    # Steal via atomic rename, not rm+retry: with rm, two stealers could both
+    # "win" — B's rm deleted the fresh lock A had just re-created, and both
+    # workers walked off owning the ticket. mv is the atomic arbiter (exactly
+    # one mv of the stale sidecar succeeds); the loser exits refused.
+    if ! mv "$claim" "${claim}.steal.$$" 2>/dev/null; then
+      echo "nightshift-ticket: refusing — ${id} claim race lost" >&2; exit 2
+    fi
+    rm -f "${claim}.steal.$$"
+    if ! try_lock; then
+      echo "nightshift-ticket: refusing — ${id} claim race lost" >&2; exit 2
+    fi
+  fi
+  now="$(now_utc)"
+  printf '%s %s\n' "$who" "$now" > "$claim"
+  python3 - "$f" "$who" "$now" <<'PY' || true
+import json, os, sys
+p, who, now = sys.argv[1:4]
+with open(p) as f: t = json.load(f)
+t["claimedBy"] = who
+t["claimedAt"] = now
+t["updated"] = now
+tmp = p + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as f:
+    json.dump(t, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, p)
+PY
+  echo "${id} claimed by ${who}"
+  ;;
+
+review)
+  id="${1:-}"; note="${2:-}"; need_id "$id"
+  if [ -z "$note" ]; then
+    echo "usage: nightshift-ticket review <id> \"<note: what you did + where to look>\"" >&2; exit 2
+  fi
+  f="${dir}/${id}.json"
+  if [ ! -f "$f" ]; then echo "nightshift-ticket: no such ticket ${id}" >&2; exit 1; fi
+  python3 - "$f" "$agent" "$note" "$(now_utc)" <<'PY'
+import json, os, sys
+p, agent, note, now = sys.argv[1:5]
+with open(p) as f: t = json.load(f)
+if t.get("status") != "open":
+    print("nightshift-ticket: refusing — ticket is '%s', agents may only move open -> review"
+          % t.get("status"), file=sys.stderr)
+    sys.exit(2)
+t["status"] = "review"
+t["updated"] = now
+t.setdefault("notes", []).append({"at": now, "by": agent, "text": note[:16384]})
+tmp = p + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as f:
+    json.dump(t, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, p)
+print("%s -> review" % t["id"])
+PY
+  rm -f "${dir}/${id}.claim"   # left the open pool, drop the lock
+  ;;
+
+comment)
+  id="${1:-}"; note="${2:-}"; need_id "$id"
+  if [ -z "$note" ]; then
+    echo "usage: nightshift-ticket comment <id> \"<note>\"" >&2; exit 2
+  fi
+  f="${dir}/${id}.json"
+  if [ ! -f "$f" ]; then echo "nightshift-ticket: no such ticket ${id}" >&2; exit 1; fi
+  python3 - "$f" "$agent" "$note" "$(now_utc)" <<'PY'
+import json, os, sys
+p, agent, note, now = sys.argv[1:5]
+with open(p) as f: t = json.load(f)
+if t.get("status") == "closed":
+    print("nightshift-ticket: refusing — ticket is closed", file=sys.stderr)
+    sys.exit(2)
+t["updated"] = now
+t.setdefault("notes", []).append({"at": now, "by": agent, "text": note[:16384]})
+tmp = p + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as f:
+    json.dump(t, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, p)
+print("%s: note added" % t["id"])
+PY
+  ;;
+
+close)
+  # steward-only in practice (ADR-0008): close a ticket whose work has actually
+  # landed. Gated to review-state + a non-empty evidence note, so an exec worker
+  # that just moved its own ticket to review can't also close it — the steward
+  # runs before exec each night and only ever closes prior, reviewed work.
+  id="${1:-}"; note="${2:-}"; need_id "$id"
+  if [ -z "$note" ]; then
+    echo "usage: nightshift-ticket close <id> \"<evidence: merge SHA/PR + live proof>\"" >&2; exit 2
+  fi
+  f="${dir}/${id}.json"
+  if [ ! -f "$f" ]; then echo "nightshift-ticket: no such ticket ${id}" >&2; exit 1; fi
+  python3 - "$f" "$agent" "$note" "$(now_utc)" <<'PY'
+import json, os, sys
+p, agent, note, now = sys.argv[1:5]
+with open(p) as f: t = json.load(f)
+if t.get("status") != "review":
+    print("nightshift-ticket: refusing — ticket is '%s', close only moves review -> closed"
+          % t.get("status"), file=sys.stderr)
+    sys.exit(2)
+t["status"] = "closed"
+t["updated"] = now
+t.setdefault("notes", []).append({"at": now, "by": agent, "text": note[:16384]})
+tmp = p + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as f:
+    json.dump(t, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, p)
+print("%s -> closed" % t["id"])
+PY
+  rm -f "${dir}/${id}.claim"   # left the open pool, drop the lock
+  ;;
+
+*)
+  echo "usage: nightshift-ticket create|list|show|claim|review|comment|close …  (see header of $0)" >&2
+  exit 2
+  ;;
+esac

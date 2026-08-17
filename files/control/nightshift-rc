@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# Privileged helper for the nightshift control plane. Runs as root via a scoped
+# sudoers entry (agent may run ONLY this script). It validates its own args, so
+# the sudoers grant can't be abused to run arbitrary systemctl commands.
+#
+#   nightshift-rc start|stop|status|ttl <instance>   (instance = <company> or <company>__<slot>)
+#   nightshift-rc sessions <agent>
+#   nightshift-rc run|stop-run|run-status <agent> <run-id>
+#   nightshift-rc runs <agent>
+#
+# start: brings up claude-remote-control@<instance> AND arms a one-shot 24h
+#        transient timer that stops it (so a forgotten server can't become
+#        always-on). stop: brings it down and cancels the timer.
+# ttl:   prints the unix timestamp of the pending auto-stop ("" if none).
+# sessions: one "<instance> <state>" line per live remote-control session for an
+#        agent (default + any named slots), so the control plane can list them.
+# run:   starts a night run — a transient unit running the pty launcher as the
+#        agent user with the agent's env, plus an 8h auto-stop. The prompt is
+#        NOT an argument: the launcher reads ~/.nightshift/jobs/<agent>/<id>.prompt,
+#        so nothing free-form ever crosses the sudo boundary.
+set -euo pipefail
+
+action="${1:-}"
+# $2 is an INSTANCE for server verbs (start/stop/status/ttl): "<company>" or
+# "<company>__<slot>". For run/sessions verbs it is a bare agent. We derive the
+# company (always the fail-closed allowlist key) by splitting on the FIRST "__".
+instance="${2:-}"
+runid="${3:-}"
+
+agent_user="agent"
+agent_home="/home/${agent_user}"
+
+company="${instance%%__*}"
+slot=""
+[[ "$company" != "$instance" ]] && slot="${instance#*__}"
+
+# Max concurrent remote-control sessions per company (defense in depth; the UI
+# also guards). A NEW named slot beyond this is refused at the sudo boundary.
+rc_max_sessions="${RC_MAX_SESSIONS:-6}"
+
+# Only the playground agent is ever touched; anything else fails closed.
+case "$company" in
+  playground) ;;
+  *) echo "nightshift-rc: refusing unknown agent '${company}'" >&2; exit 2 ;;
+esac
+
+# A session slot is operator/control-plane input that becomes part of a unit
+# name. Constrain it hard: lowercase alnum + single dashes, no "__" (that's the
+# company/slot separator), 2-21 chars. Empty slot = the default session.
+if [[ -n "$slot" ]]; then
+  [[ "$slot" =~ ^[a-z0-9]([a-z0-9-]{0,19}[a-z0-9])?$ ]] \
+    || { echo "nightshift-rc: bad session slot '${slot}'" >&2; exit 2; }
+fi
+
+# Run ids are minted by the control plane; constrain them anyway so they can't
+# inject unit-name globs or path segments through the sudo boundary.
+need_runid() {
+  [[ "$runid" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] \
+    || { echo "nightshift-rc: bad run id '${runid}'" >&2; exit 2; }
+}
+
+# epoch of a timer's next elapse, "" if the timer doesn't exist / isn't armed.
+# Autostops are armed as ABSOLUTE OnCalendar timers (see start/run) so they
+# don't re-anchor on daemon-reload. Parsing the wall-clock NEXT column of
+# list-timers reads the fire time uniformly for calendar timers (and for any
+# legacy monotonic --on-active timer still lingering from before this change).
+timer_epoch() {
+  local next
+  next="$(systemctl list-timers "$1" --no-legend --no-pager 2>/dev/null \
+    | awk 'NR==1{print $1" "$2" "$3" "$4}')"
+  [[ -n "$next" ]] && date -d "$next" +%s 2>/dev/null || echo ""
+}
+
+# Server verbs key on the full instance (so each session has its own unit +
+# autostop timer); run verbs key on the bare agent (= company).
+unit="claude-remote-control@${instance}"
+ttl="rc-autostop-${instance}"           # transient autostop unit name (per session)
+runit="nightshift-run-${company}-${runid}"
+rstop="nightshift-run-stop-${company}-${runid}"
+
+case "$action" in
+  start)
+    # Cap concurrent sessions per company. Only gate NEW named slots — the
+    # default session and restarts of an already-live slot are always allowed.
+    if [[ -n "$slot" ]] && ! systemctl is-active --quiet "$unit"; then
+      n="$(systemctl list-units "claude-remote-control@${company}*" \
+            --plain --no-legend 2>/dev/null | grep -c . || true)"
+      if (( ${n:-0} >= rc_max_sessions )); then
+        echo "nightshift-rc: session cap (${rc_max_sessions}) reached for ${company}" >&2
+        exit 3
+      fi
+    fi
+    # Arm the 24h autostop BEFORE starting the unit (clear any prior timer first
+    # so systemd-run won't collide on the unit name). Timer-first ordering: if
+    # the timer can't be armed we refuse to start at all — the old order could
+    # leave a session running with NO auto-stop when the second systemd-run
+    # failed under set -e, i.e. an immortal unattended session.
+    systemctl stop "${ttl}.timer" 2>/dev/null || true
+    systemctl reset-failed "${ttl}.service" 2>/dev/null || true
+    # Arm the stop at an ABSOLUTE wall-clock time, NOT --on-active=24h. A
+    # monotonic OnActiveSec timer re-anchors to "now" on every `systemctl
+    # daemon-reload` (systemd #6680), so a `make deploy` (install.sh runs a
+    # daemon-reload) while a session is live would silently restart the full 24h
+    # from reload time — a forgotten server could then outlive its cap, and
+    # repeated reloads extend it repeatedly. An OnCalendar timestamp is absolute:
+    # daemon-reload recomputes the same fire time, so it never drifts. Computed
+    # once here; if `date` somehow fails, set -e aborts before we start the unit
+    # (fail-closed — no session without an armed auto-stop).
+    until_ts="$(date -d '+24 hours' '+%Y-%m-%d %H:%M:%S')"
+    systemd-run --quiet --unit="$ttl" --on-calendar="$until_ts" \
+      --timer-property=AccuracySec=1min \
+      /usr/bin/systemctl stop "$unit" \
+      || { echo "nightshift-rc: cannot arm auto-stop, refusing to start ${unit}" >&2; exit 1; }
+    systemctl start "$unit" \
+      || { systemctl stop "${ttl}.timer" 2>/dev/null || true; exit 1; }
+    echo "started ${unit} (auto-stop in 24h)"
+    ;;
+  stop)
+    systemctl stop "$unit"
+    systemctl stop "${ttl}.timer" 2>/dev/null || true
+    systemctl reset-failed "${ttl}.service" 2>/dev/null || true
+    echo "stopped ${unit}"
+    ;;
+  status)
+    # prints "active" / "inactive"/"failed"; never error out (exit 0)
+    systemctl is-active "$unit" 2>/dev/null || true
+    ;;
+  ttl)
+    timer_epoch "${ttl}.timer"
+    ;;
+  sessions)
+    # one "<instance> <state>" line per live remote-control session for this
+    # company (default + named slots). No --all: only active/activating units,
+    # i.e. sessions that are actually alive. The case still boundary-checks
+    # each line before returning it.
+    systemctl list-units "claude-remote-control@${company}*.service" \
+        --plain --no-legend 2>/dev/null \
+      | while read -r u _ st _; do
+          u="${u%.service}"
+          inst="${u#claude-remote-control@}"
+          case "$inst" in
+            "$company"|"$company"__*) echo "${inst} ${st}" ;;
+          esac
+        done
+    ;;
+  run)
+    need_runid
+    [[ -f "${agent_home}/.nightshift/jobs/${company}/${runid}.prompt" ]] \
+      || { echo "nightshift-rc: no prompt file for run '${runid}'" >&2; exit 1; }
+    # Optional per-run auto-stop, minutes, from the agent-owned <id>.stop
+    # sidecar (late waves like review/synth must die before the operator's
+    # morning limit window). Agent-controlled input to a root timer, so:
+    # digits only, clamped to [10,480] — an agent can shorten its own runs,
+    # never extend past the old fixed 8h.
+    mins=480
+    stop_file="${agent_home}/.nightshift/jobs/${company}/${runid}.stop"
+    if [[ -f "$stop_file" ]]; then
+      m="$(tr -d '[:space:]' < "$stop_file")"
+      if [[ "$m" =~ ^[0-9]{1,3}$ ]] && (( m >= 10 && m <= 480 )); then
+        mins="$m"
+      else
+        echo "nightshift-rc: ignoring bad stop sidecar '${m}' (using 480m)" >&2
+      fi
+    fi
+    systemctl stop "${rstop}.timer" 2>/dev/null || true
+    systemctl reset-failed "${rstop}.service" "${runit}.service" 2>/dev/null || true
+    # Timer BEFORE workload: the reverse order could leave a night run with no
+    # auto-stop if the timer's systemd-run failed after the run started —
+    # burning Opus into the operator's morning window. Stopping a not-yet-
+    # started unit is a harmless no-op, so timer-first has no such hole.
+    # ABSOLUTE wall-clock stop (NOT --on-active=${mins}m) — same reason as the
+    # 24h autostop above: a monotonic OnActiveSec timer re-anchors on every
+    # daemon-reload (systemd #6680), so a `make deploy` mid-run would push this
+    # run's auto-stop out by the FULL window from reload time, straight into the
+    # operator's morning limit window. Compute the target once, arm it absolute.
+    until_ts="$(date -d "+${mins} minutes" '+%Y-%m-%d %H:%M:%S')"
+    systemd-run --quiet --unit="$rstop" --on-calendar="$until_ts" \
+      --timer-property=AccuracySec=1min \
+      /usr/bin/systemctl stop "${runit}.service" \
+      || { echo "nightshift-rc: cannot arm auto-stop, refusing to start run ${runid}" >&2; exit 1; }
+    systemd-run --quiet --unit="$runit" \
+      --property=User="$agent_user" \
+      --property=WorkingDirectory="${agent_home}/workspace/${company}" \
+      --property=EnvironmentFile=-/etc/nightshift/secrets/"${company}".env \
+      --setenv=HOME="$agent_home" \
+      /usr/local/bin/nightshift-run-launcher "$company" "$runid" \
+      || { systemctl stop "${rstop}.timer" 2>/dev/null || true; exit 1; }
+    echo "started night run ${runit} (auto-stop in ${mins}m)"
+    ;;
+  stop-run)
+    need_runid
+    systemctl stop "${runit}.service" 2>/dev/null || true
+    systemctl stop "${rstop}.timer" 2>/dev/null || true
+    systemctl reset-failed "${runit}.service" "${rstop}.service" 2>/dev/null || true
+    echo "stopped night run ${runit}"
+    ;;
+  run-status)
+    need_runid
+    # "active" while the session lives (incl. idling), "inactive" after stop
+    systemctl is-active "${runit}.service" 2>/dev/null || true
+    ;;
+  runs)
+    # one "<run-id> <state>" line per live night-run unit for this agent
+    # (stop-timers don't match: their prefix is nightshift-run-stop-)
+    systemctl list-units "nightshift-run-${company}-*.service" \
+        --plain --no-legend --all 2>/dev/null \
+      | while read -r u _ st _; do
+          u="${u%.service}"
+          echo "${u#nightshift-run-${company}-} ${st}"
+        done
+    ;;
+  *)
+    echo "usage: nightshift-rc start|stop|status|ttl <instance> | sessions <agent> | run|stop-run|run-status <agent> <run-id> | runs <agent>" >&2
+    exit 2
+    ;;
+esac

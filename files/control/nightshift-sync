@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# nightshift-sync — box-side prompt sync, fired every 15 minutes by
+# nightshift-sync.timer (Type=oneshot, runs as root).
+#
+# Pulls /opt/nightshift (ff-only) and re-copies ONLY the night-run prompt
+# surface — sweep prompts, contract.md, and the launcher/probe scripts — to the
+# same destinations install.sh uses. It must NEVER rebuild the Go control
+# binary or restart/reload any service: machinery deploys go through
+# `make deploy` / install.sh; this timer only keeps prompts fresh so a merged
+# prompt PR lands on the box before the next night without an operator SSH.
+#
+# Fail quietly-but-loudly: any pull failure (diverged history, dead token,
+# network) logs to the journal and exits nonzero WITHOUT copying anything —
+# half-synced prompts are worse than stale ones.
+set -euo pipefail
+
+REPO=/opt/nightshift
+log() { echo "[nightshift-sync] $*"; }
+
+# agent user from the boot env (default matches the live box)
+AGENT_USER=agent
+if [[ -f /etc/nightshift/nightshift.env ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . /etc/nightshift/nightshift.env
+  set +a
+fi
+AGENT_HOME="/home/${AGENT_USER}"
+
+# The stored remote is token-scrubbed on purpose (SETUP.md) — auth rides
+# GH_TOKEN from the secrets env, sourced the safe way (never `export $(xargs)`,
+# which word-splits token values).
+if [[ -r /etc/nightshift/secrets/playground.env ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . /etc/nightshift/secrets/playground.env
+  set +a
+fi
+if [[ -z "${GH_TOKEN:-}" ]]; then
+  log "no GH_TOKEN available — cannot pull; touching nothing"
+  exit 1
+fi
+export GH_TOKEN
+
+# ff-only pull through an ephemeral credential helper (same echo-the-env-token
+# mechanism as the box's ~/.gitconfig helpers): the token never lands in argv,
+# .git/config, or the journal, and the scrubbed remote URL stays scrubbed.
+# rc=0; out="$(cmd)" || rc=$? — the set -e assignment gotcha (CLAUDE.md).
+rc=0
+# shellcheck disable=SC2016  # the helper must expand GH_TOKEN when git runs it, not here
+out="$(git -C "$REPO" \
+  -c credential.helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f' \
+  pull --ff-only origin main 2>&1)" || rc=$?
+if [[ $rc -ne 0 ]]; then
+  log "git pull --ff-only failed (rc=${rc}): ${out}"
+  log "touching nothing — fix the pull (diverged history? dead token?) or run install.sh"
+  exit 1
+fi
+log "pull: $(head -1 <<<"$out")"
+
+# Re-copy ONLY the prompt surface — destinations/ownership/modes mirror
+# install.sh's night-run section exactly. No builds, no systemctl.
+for f in "${REPO}"/files/nightrun/sweep/*.md; do
+  install -o "${AGENT_USER}" -g "${AGENT_USER}" -m 0644 "$f" "${AGENT_HOME}/.nightshift/sweep/$(basename "$f")"
+done
+install -o "${AGENT_USER}" -g "${AGENT_USER}" -m 0644 \
+  "${REPO}/files/nightrun/contract.md" "${AGENT_HOME}/.nightshift/contract.md"
+install -m0755 "${REPO}/files/nightrun/nightshift-run-launcher" /usr/local/bin/nightshift-run-launcher
+install -m0755 "${REPO}/files/nightrun/claude-auth-probe" /usr/local/bin/claude-auth-probe
+install -m0755 "${REPO}/files/nightrun/forge-auth-probe" /usr/local/bin/forge-auth-probe
+install -m0755 "${REPO}/files/nightrun/codex-auth-probe" /usr/local/bin/codex-auth-probe
+
+log "synced sweep prompts + contract + launcher/probes ($(git -C "$REPO" rev-parse --short HEAD))"

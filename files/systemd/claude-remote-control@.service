@@ -1,0 +1,24 @@
+[Unit]
+# Template: one instance per remote-control SESSION, e.g.
+#   systemctl start claude-remote-control@playground        (default session)
+#   systemctl start claude-remote-control@playground__dev  (extra named session)
+# %i = "playground" or "playground__<slot>". The launcher derives the workspace
+# and environment from it, so several sessions share one workspace while
+# presenting as distinct endpoints. See files/control/claude-rc-launch.
+Description=Claude Code remote-control (%i session)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__AGENT_USER__
+# WorkingDirectory + playground env are handled inside the launcher, because a
+# slotted %i (playground__dev) is not a real workspace/env path.
+Environment=HOME=__AGENT_HOME__
+ExecStart=/usr/local/bin/claude-rc-launch %i
+# 10-min network outage exits the process; bring it back.
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+services:
+  # Rewrites Traefik's /v1.24/ docker API calls to a version Docker 29 accepts.
+  dockerproxy:
+    image: nginx:alpine
+    restart: unless-stopped
+    networks: [web]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-proxy.conf:/etc/nginx/nginx.conf:ro
+
+  traefik:
+    image: traefik:v3.5
+    restart: unless-stopped
+    depends_on: [dockerproxy]
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - web
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the host control plane (:8787)
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+      - ./letsencrypt:/letsencrypt
+    labels:
+      - traefik.enable=true
+
+networks:
+  web:
+    external: true

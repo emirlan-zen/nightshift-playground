@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# Night-run launcher. Executed inside a transient systemd unit as the agent
+# user (see nightshift-rc `run`), cwd = ~/workspace/<agent>. Composes the full
+# prompt (contract + run preamble + task) and starts an interactive Claude
+# Code session with Remote Control enabled, so the operator can attach from
+# the Claude app mid-night or in the morning.
+#
+# The pty wrapper is load-bearing: without a TTY, `claude --remote-control`
+# silently degrades to --print mode and never registers with remote control.
+set -euo pipefail
+
+company="${1:?usage: nightshift-run-launcher <agent> <run-id>}"
+runid="${2:?usage: nightshift-run-launcher <agent> <run-id>}"
+
+ns="$HOME/.nightshift"
+prompt_file="${ns}/jobs/${company}/${runid}.prompt"
+model_file="${ns}/jobs/${company}/${runid}.model"
+effort_file="${ns}/jobs/${company}/${runid}.effort"
+executor_file="${ns}/jobs/${company}/${runid}.executor"
+workdir_file="${ns}/jobs/${company}/${runid}.workdir"
+report_dir="${ns}/reports/${company}"
+report="${report_dir}/${runid}.md"
+
+[[ -f "$prompt_file" ]] || { echo "no prompt file: ${prompt_file}" >&2; exit 1; }
+mkdir -p "$report_dir"
+
+# Optional executor sidecar (ADR-0018): which engine runs this session.
+# Allowlist only; garbage is NON-fatal and falls back to claude — same posture
+# as model/effort, a typo'd sidecar must not kill the wave.
+executor="claude"
+if [[ -f "$executor_file" ]]; then
+  e="$(tr -d '[[:space:]]' < "$executor_file")"
+  case "$e" in
+    claude|codex) executor="$e" ;;
+    *) echo "ignoring bad executor in ${executor_file}: '${e}' (using claude)" >&2 ;;
+  esac
+fi
+
+# Flow runs use a dedicated worktree under the agent workspace. Keeping the
+# path below ~/workspace/<agent> preserves the cwd-scoped forge/Jira/gcloud
+# wrappers while preventing unattended sessions from changing the checkout a
+# manual remote-control session is using. Fail closed on a forged sidecar.
+if [[ -f "$workdir_file" ]]; then
+  workdir="$(tr -d '\r\n' < "$workdir_file")"
+  workspace="${HOME}/workspace/${company}"
+  case "$workdir" in
+    "${workspace}/.nightshift-worktrees/"*)
+      [[ -d "$workdir" ]] || { echo "flow worktree missing: ${workdir}" >&2; exit 1; }
+      cd -- "$workdir"
+      # Claude Code shows a per-path workspace-trust dialog on first open, and
+      # a headless pty session idles its ENTIRE window on it (2026-08-17: both
+      # factory stage-1 members burned their 50m windows on the dialog — claude
+      # 2.1.x no longer trusts fresh worktree paths under a trusted workspace).
+      # Pre-accept for this worktree exactly like post-auth.sh does for the
+      # workspaces. Own flock: concurrent member launches must not tear
+      # ~/.claude.json (same torn-write physics as the OAuth creds file).
+      # Failure is NON-fatal — a launch that still hits the dialog is no worse
+      # than before, and the watchdog makes it loud.
+      if [[ "$executor" == "claude" ]]; then
+        ( flock -w 60 9 && python3 - "$HOME/.claude.json" "$workdir" <<'PY'
+import json, os, sys
+conf, wd = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(conf))
+except Exception:
+    sys.exit(0)  # missing/corrupt config: not this guard's problem
+e = d.setdefault("projects", {}).setdefault(wd, {})
+if not (e.get("hasTrustDialogAccepted") and e.get("hasCompletedProjectOnboarding")):
+    e["hasTrustDialogAccepted"] = True
+    e["hasCompletedProjectOnboarding"] = True
+    tmp = conf + ".trust.tmp"
+    json.dump(d, open(tmp, "w"), indent=2)
+    os.replace(tmp, conf)
+PY
+        ) 9>"${ns}/claude-trust.lock" \
+          || echo "trust pre-accept failed for ${workdir} (continuing)" >&2
+      fi
+      ;;
+    *)
+      echo "refusing flow workdir outside ${workspace}/.nightshift-worktrees: ${workdir}" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Optional coordinator model (agent-owned sidecar, no sudo boundary). Validated
+# before it becomes a CLI arg. Absent = account default (the common case).
+# Garbage is NON-fatal, same posture as effort below: falling back to the
+# account default beats killing the wave with no report over a typo'd sidecar.
+model=""
+if [[ -f "$model_file" ]]; then
+  model="$(tr -d '[[:space:]]' < "$model_file")"
+  if ! [[ "$model" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "ignoring bad model in ${model_file}: '${model}' (using account default)" >&2
+    model=""
+  fi
+fi
+model_arg=""
+[[ -n "$model" ]] && model_arg="--model $(printf '%q' "$model") "
+
+# Optional reasoning effort (agent-owned sidecar). Unlike model, an unknown
+# effort is NON-fatal: omit the flag and fall back to the model default rather
+# than kill the night over a typo. Allowlist only — never an arbitrary arg.
+effort=""
+effort_arg=""
+if [[ -f "$effort_file" ]]; then
+  effort="$(tr -d '[[:space:]]' < "$effort_file")"
+  case "$effort" in
+    low|medium|high|xhigh|max) effort_arg="--effort ${effort} " ;;
+    *)
+      echo "ignoring bad effort in ${effort_file}: '${effort}' (using model default)" >&2
+      effort=""
+      ;;
+  esac
+fi
+# Codex tops out at xhigh (its `max` is unconfirmed in config) — clamp rather
+# than drop: an operator who asked for max wants the ceiling, not the default.
+if [[ "$executor" == "codex" && "$effort" == "max" ]]; then effort="xhigh"; fi
+
+# Pre-flight: a wave with dead Claude auth is a GUARANTEED no-op that still
+# burns its whole window — the 2026-07-04 silent night (ADR-0006). Probe auth
+# before starting; if dead, write a loud failure report + a marker the control
+# plane surfaces, and skip (clean exit) rather than start a certain failure.
+#
+# The probe forces an OAuth token refresh, and concurrent refreshes are the
+# 2026-07-05 silent night: overlapping waves each rewrite ~/.claude/.credentials.json
+# on refresh, one interleaves a torn/empty write (refreshToken=""), and EVERY
+# session is logged out for the rest of the night. The serializing flock lives
+# INSIDE claude-auth-probe (so the control plane's 10-min health ticker is
+# serialized too — it used to probe lock-free); do NOT re-take it here, a second
+# layer on the same file would stall every wave start for the lock cap.
+probe="${CLAUDE_AUTH_PROBE:-/usr/local/bin/claude-auth-probe}"
+if [[ "$executor" == "claude" && -x "$probe" ]]; then
+  # `prc=0; …=$(cmd) || prc=$?` — NOT `…=$(cmd); prc=$?`: under set -e a failing
+  # command substitution in a plain assignment kills the script before prc is
+  # read, which silently disabled this whole skip path (found 2026-07-06).
+  prc=0; reason="$("$probe" "$PWD" 2>&1)" || prc=$?
+  # Exit 2/3 are real auth verdicts. Anything else is a PROBE error (timeout,
+  # network blip, OOM) — retry once, and if it still errors, proceed with the
+  # wave rather than skip it: a skipped healthy night costs more than a wave
+  # that fails fast on its own if auth truly is dead.
+  if [[ $prc -ne 0 && $prc -ne 2 && $prc -ne 3 ]]; then
+    sleep 15
+    prc=0; reason="$("$probe" "$PWD" 2>&1)" || prc=$?
+  fi
+  if [[ $prc -ne 0 && $prc -ne 2 && $prc -ne 3 ]]; then
+    echo "auth probe errored twice (rc=${prc}): ${reason} — proceeding anyway" >&2
+    prc=0
+  fi
+  if [[ $prc -ne 0 ]]; then
+    ts="$(date -Is)"
+    cat > "$report" <<EOF
+# ⚠️ NIGHT RUN SKIPPED — Claude not authenticated
+
+- Agent: ${company}
+- Run id: ${runid}
+- Time: ${ts}
+- Pre-flight: ${reason}
+
+Claude Code failed its auth pre-flight, so this wave was **skipped** instead of
+started — it would have produced nothing but consumed its whole window (see
+ADR-0006). Re-login on the box as the agent user (\`claude\` then \`/login\`);
+the next wave will run once auth is restored.
+EOF
+    : > "${report_dir}/${runid}.authfail"
+    echo "auth pre-flight failed: ${reason} — skipping ${company}/${runid}" >&2
+    exit 0
+  fi
+fi
+
+# Codex waves (ADR-0018) get the same pre-flight against the OTHER credential
+# file (~/.codex/auth.json). Same failure physics: single-use refresh tokens,
+# concurrent refreshes race, the loser logs the whole account out — the probe
+# owns its own flock (codex-auth.lock) exactly like the claude probe owns its.
+# Same verdicts: 2/3 = dead auth -> loud skip report + .authfail marker; any
+# other probe error retries once then fails OPEN.
+codex_probe="${CODEX_AUTH_PROBE:-/usr/local/bin/codex-auth-probe}"
+if [[ "$executor" == "codex" && -x "$codex_probe" ]]; then
+  # rc=0; …="$(cmd)" || rc=$? — the set -e assignment gotcha, same as above
+  prc=0; reason="$("$codex_probe" "$PWD" 2>&1)" || prc=$?
+  if [[ $prc -ne 0 && $prc -ne 2 && $prc -ne 3 ]]; then
+    sleep 15
+    prc=0; reason="$("$codex_probe" "$PWD" 2>&1)" || prc=$?
+  fi
+  if [[ $prc -ne 0 && $prc -ne 2 && $prc -ne 3 ]]; then
+    echo "codex auth probe errored twice (rc=${prc}): ${reason} — proceeding anyway" >&2
+    prc=0
+  fi
+  if [[ $prc -ne 0 ]]; then
+    ts="$(date -Is)"
+    cat > "$report" <<EOF
+# ⚠️ NIGHT RUN SKIPPED — Codex not authenticated
+
+- Agent: ${company}
+- Run id: ${runid}
+- Executor: codex
+- Time: ${ts}
+- Pre-flight: ${reason}
+
+This wave runs on the Codex executor and Codex failed its auth pre-flight, so
+it was **skipped** instead of started (ADR-0018, same rationale as ADR-0006).
+Re-auth on the box as the agent user: \`cd ~/workspace/playground && codex login
+--device-auth\` (SETUP.md runbook); the next codex wave will run once auth is
+restored. Claude waves are unaffected.
+EOF
+    : > "${report_dir}/${runid}.authfail"
+    echo "codex auth pre-flight failed: ${reason} — skipping ${company}/${runid}" >&2
+    exit 0
+  fi
+fi
+
+# Second pre-flight: the FORGE token (GH/GitLab PAT). Unlike Claude auth, a
+# dead forge token does NOT doom the wave — analysis/read work still functions —
+# so this NEVER skips. Instead: drop an <id>.forgefail marker (surfaced by the
+# control plane) and prepend a loud warning to the prompt so the session plans
+# around it (no pushes/PRs tonight) instead of discovering 401s mid-ticket.
+# Probe may be missing on an old box — guard with [[ -x ]] and proceed, same as
+# the Claude probe above.
+forge_probe="${FORGE_AUTH_PROBE:-/usr/local/bin/forge-auth-probe}"
+forge_warn=""
+if [[ -x "$forge_probe" ]]; then
+  # rc=0; …="$(cmd)" || rc=$? — the set -e assignment gotcha, same as above
+  frc=0; fout="$("$forge_probe" "$company" 2>&1)" || frc=$?
+  if [[ $frc -eq 2 ]]; then
+    : > "${report_dir}/${runid}.forgefail"
+    echo "forge token DEAD for ${company}: ${fout} — continuing analysis-only" >&2
+    forge_warn="## ⚠️ FORGE TOKEN DEAD — read/analysis mode
+Pre-flight found this agent's forge token (GitHub/GitLab PAT) is NOT working:
+${fout}
+Pushes, PR/MR creation, private clones, and API writes WILL fail tonight. Do
+NOT burn the window retrying them. Do the read/analysis/local share of your
+task (plans, local builds+tests, reviews of already-cloned repos), and report
+the token outage prominently in the morning report so the operator rotates it."
+  elif [[ $frc -ne 0 && $frc -ne 3 ]]; then
+    # 3 = no token configured (n/a); anything else (4/network) fails OPEN
+    echo "forge probe inconclusive for ${company} (rc=${frc}): ${fout} — proceeding" >&2
+  fi
+fi
+
+# The session's real window, from the same <id>.stop sidecar nightshift-rc arms
+# the auto-stop from (same clamp, so the prompt never disagrees with the timer).
+# Without this line every wave has to guess its runway from static prompt text —
+# and a governor top-up minted at 05:00 would believe the exec prompt's "~7h".
+stop_file="${ns}/jobs/${company}/${runid}.stop"
+mins=480
+if [[ -f "$stop_file" ]]; then
+  m="$(tr -d '[:space:]' < "$stop_file")"
+  if [[ "$m" =~ ^[0-9]+$ ]] && (( m >= 10 && m <= 480 )); then mins="$m"; fi
+fi
+started="$(date '+%H:%M %Z')"
+stops_at="$(date -d "+${mins} minutes" '+%H:%M %Z' 2>/dev/null || echo '?')"
+
+prompt="$(
+  if [[ -n "$forge_warn" ]]; then printf '%s\n\n' "$forge_warn"; fi
+  cat "${ns}/contract.md" 2>/dev/null || true
+  printf '\n## This run\n- Agent: %s\n- Run id: %s\n- Started: %s — hard auto-stop in %s minutes (≈ %s). This OVERRIDES any window length the task text assumes; plan backwards from it and keep the report current as you go.\n- Write the morning report to: %s\n- Report banner ART PLATE (text-free; SYNTH WAVE ONLY paints it — see contract): %s\n\n## Task\n' \
+    "$company" "$runid" "$started" "$mins" "$stops_at" "$report" "${report_dir}/${runid}.plate.png"
+  cat "$prompt_file"
+)"
+
+# Codex executor (ADR-0018): `codex exec` is genuinely headless — no pty, no
+# Remote Control registration (the operator can't attach to a codex wave from
+# the Claude app; its deliverable is the report file). Sandbox/approvals are
+# bypassed for the same reason claude runs bypassPermissions at night: the
+# session must act unattended, and the blast radius is bounded by the contract
+# + the cwd-scoped credential wrappers, not by an interactive prompt. Effort
+# rides `-c model_reasoning_effort=…` (codex has no --effort flag); `-o`
+# captures the final message next to the report for post-mortems (the dotted
+# name can never be listed as a report — runIDRe rejects dots).
+if [[ "$executor" == "codex" ]]; then
+  codex_args=(exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)
+  [[ -n "$model" ]] && codex_args+=(-m "$model")
+  [[ -n "$effort" ]] && codex_args+=(-c "model_reasoning_effort=${effort}")
+  codex_args+=(-o "${report_dir}/${runid}.last.md")
+  exec codex "${codex_args[@]}" "$prompt" </dev/null
+fi
+
+# script(1) gives claude the pty systemd won't; -e propagates claude's exit code
+exec script -qfec \
+  "claude ${model_arg}${effort_arg}--remote-control $(printf '%q' "night-${company}-${runid}") $(printf '%q' "$prompt")" \
+  /dev/null

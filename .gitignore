@@ -1,0 +1,42 @@
+# Terraform
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+terraform/terraform.tfvars
+crash.log
+
+# Secrets — never commit
+*.pem
+*.key
+*-sa-key.json
+# Avoid broad service-account globs that can hide ordinary JSON fixtures.
+*service-account*.json
+github_pat
+.git-credentials
+*.env
+!terraform/terraform.tfvars.example
+
+# Traefik runtime
+files/traefik/letsencrypt/
+files/traefik/acme.json
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# Build artifacts
+control/control
+control/control-e2e
+
+# Dev mode: scratch HOME seeded by NIGHTSHIFT_DEV (`make dev`)
+control/.devhome/
+
+# Frontend: web/dist IS committed (embedded into the Go binary via go:embed);
+# ignore deps + build caches only.
+control/web/node_modules/
+control/web/.vite/
+control/web/*.tsbuildinfo
+
+# Playwright e2e
+control/web/test-results/
+control/web/playwright-report/
+control/web/.playwright/

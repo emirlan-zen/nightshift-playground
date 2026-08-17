@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Active Codex CLI auth pre-flight probe (ADR-0018) — the claude-auth-probe
+# pattern applied to the second executor.
+#
+# Exit 0  = authenticated (a real authed `codex exec` call succeeded).
+# Exit !=0 = NOT usable; a one-line reason is printed to stdout.
+#   2 = not authenticated (sign-in required / refresh token dead)
+#   3 = no credentials file at all (~/.codex/auth.json)
+#   other = probe error (timeout, missing binary, network)
+#
+# Why active: Codex OAuth refresh tokens are single-use, and two concurrent
+# processes sharing ~/.codex/auth.json race the refresh — the loser gets
+# `refresh_token_reused` and the account is logged out until a manual re-login
+# (openai/codex#10332; the exact failure class as our 2026-07-05 Claude torn-
+# creds night). A disk check can't see any of that; only an authed call can.
+#
+# The serializing flock lives HERE (codex-auth.lock — its own lock, NOT
+# claude-auth.lock: the two credential files are independent and must not
+# queue behind each other's refreshes), so every caller is serialized.
+#
+# Side effect: writes a status snapshot to ~/.nightshift/health/codex.json so
+# the control plane can show codex auth health WITHOUT burning plan quota on a
+# polling ticker — freshness comes from launcher pre-flights, not a timer.
+set -uo pipefail
+
+probe_dir="${1:-$HOME/workspace/playground}"
+model="${CODEX_AUTH_PROBE_MODEL:-gpt-5.6-luna}"
+timeout_s="${CODEX_AUTH_PROBE_TIMEOUT:-90}"
+
+# Snapshot for the control plane's read-only health surface. Best-effort.
+write_health() {
+  local ok="$1" detail="$2" dir="$HOME/.nightshift/health"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '{"ok":%s,"detail":"%s","checkedAt":"%s"}\n' \
+    "$ok" "$(printf '%s' "$detail" | tr -d '"\\' | cut -c1-160)" "$(date -Is)" \
+    > "$dir/codex.json.tmp" 2>/dev/null && mv -f "$dir/codex.json.tmp" "$dir/codex.json" 2>/dev/null || true
+}
+
+cd "$probe_dir" 2>/dev/null || cd "$HOME" || exit 4
+
+creds="$HOME/.codex/auth.json"
+if [[ ! -f "$creds" ]]; then
+  write_health false "no auth.json"
+  echo "no auth.json"
+  exit 3
+fi
+
+codex_bin="$(command -v codex || true)"
+[[ -n "$codex_bin" ]] || { echo "codex binary not found on PATH"; exit 5; }
+
+lock="${CODEX_AUTH_LOCK:-$HOME/.nightshift/codex-auth.lock}"
+exec 9>"$lock" 2>/dev/null && flock -w 300 9 2>/dev/null || true
+
+# -k 10: a codex that ignores SIGTERM would otherwise hold the lock forever.
+# Default read-only sandbox: a one-word reply needs no writes, no approvals.
+out="$(timeout -k 10 "$timeout_s" "$codex_bin" exec --skip-git-repo-check \
+        -m "$model" "Reply with only: OK" </dev/null 2>&1)"
+rc=$?
+exec 9>&- 2>/dev/null || true
+
+# Same verdict rule as the claude probe: the positive signal is "the authed
+# call completed", not the reply content. Explicit auth-failure strings can
+# surface with a zero OR non-zero exit.
+if grep -qiE 'log ?out and sign in|sign in again|refresh_token_reused|not (logged|signed) in|unauthor|401|token (has )?expired|run `?codex login' <<<"$out"; then
+  reason="not authenticated ($(printf '%s' "${out//$'\n'/ }" | cut -c1-160))"
+  write_health false "$reason"
+  echo "$reason"
+  exit 2
+fi
+if [[ $rc -ne 0 ]]; then
+  reason="probe failed (rc=${rc}): $(head -1 <<<"$out")"
+  write_health false "$reason"
+  echo "$reason"
+  exit "$rc"
+fi
+write_health true "ok"
+echo "ok"
+exit 0

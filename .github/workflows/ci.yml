@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.4" # keep in step with the box (CLAUDE.md: Go pinned in 3 places)
+  NODE_VERSION: "22"
+  PNPM_VERSION: "10"
+
+jobs:
+  go:
+    name: Go (vet, lint, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: control/go.sum
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.3
+          working-directory: control
+      - name: go test (race + cover)
+        run: go test -race -cover ./...
+
+  web:
+    name: Web (typecheck, lint, format, unit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: control/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm test
+      # Build must succeed (broken src fails here). We do NOT byte-compare the
+      # committed dist: the bundle is deterministic per-machine but its content
+      # hashes differ across OS/toolchains, so a compare would false-positive in
+      # CI. Keeping dist current is a commit-time convention (`make web`).
+      - run: pnpm build
+
+  shell:
+    name: Shell (nightshift-rc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Stubs systemd on PATH — needs only bash + GNU date, both preinstalled.
+      - name: nightshift-rc auto-stop timer regression test
+        run: bash files/control/nightshift-rc.test.sh
+
+  e2e:
+    name: Web e2e (Playwright)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: control/go.sum
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: control/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run e2e (boots the Go dev-mode binary)
+        run: pnpm test:e2e

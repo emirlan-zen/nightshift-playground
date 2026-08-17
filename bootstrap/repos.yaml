@@ -1,0 +1,11 @@
+# Optional repositories cloned into ~/workspace/playground.
+# Keep this public distribution empty; add your own entries in your deployment
+# branch or clone repositories manually after setup.
+companies:
+  playground:
+    host: github
+    base: https://github.com/REPLACE_ME
+    git_user_name: REPLACE_ME
+    git_user_email: REPLACE_ME@example.com
+    layout: flat
+    repos: []

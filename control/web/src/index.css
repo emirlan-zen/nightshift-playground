@@ -1,0 +1,603 @@
+@import "tailwindcss";
+
+/* Dark ops surface on the house type system (workspace/DESIGN.md): the
+   original nightshift dark greys + single purple accent, sharp edges. */
+@theme {
+  --color-bg: #0a0b0c;
+  --color-bg2: #0e0f12;
+  --color-surface: #101114;
+  --color-raise: #17181c;
+  --color-line: #23252b;
+  --color-line2: #33363e;
+  --color-ink: #ececee;
+  --color-mut: #888c94;
+  --color-dim: #585c64;
+  --color-accent: #7c7bff;
+  --color-accent-hi: #9897ff;
+  --color-ink-on-accent: #0a0b0c;
+  --color-ok: #36d399;
+  --color-danger: #f4756b;
+  --color-review: #d9b36e;
+  --color-sched: #8fb3d9;
+
+  --font-head: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", ui-sans-serif, -apple-system, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius: 0px;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  button,
+  a,
+  input,
+  textarea,
+  select,
+  summary {
+    outline: none;
+  }
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  summary:focus-visible {
+    box-shadow:
+      0 0 0 2px var(--color-bg),
+      0 0 0 4px var(--color-accent);
+  }
+  button:disabled {
+    cursor: not-allowed;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 40%, transparent);
+  }
+}
+
+@layer components {
+  .tap-control {
+    display: grid;
+    min-width: 44px;
+    height: 44px;
+    place-items: center;
+    border: 1px solid var(--color-line2);
+    color: var(--color-mut);
+    transition:
+      border-color 120ms ease,
+      color 120ms ease,
+      background 120ms ease;
+  }
+  .tap-control:hover {
+    border-color: var(--color-ink);
+    color: var(--color-ink);
+    background: var(--color-raise);
+  }
+  .tap-control:disabled {
+    opacity: 0.3;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes sheet {
+  from {
+    transform: translateY(16px);
+    opacity: 0.4;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+/* Centering is owned by Tailwind's `-translate-x/y-1/2` utilities, which in v4
+   emit the independent `translate:` property. So this keyframe must animate
+   ONLY `transform: scale()` — if it also translated, the two would stack into a
+   double -50% offset (the old top-left "flash", made permanent once fill-mode
+   went to `both`). transform composes after translate, so scale stays centered. */
+@keyframes pop {
+  from {
+    transform: scale(0.97);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes runpulse {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+.run-node-pulse {
+  animation: runpulse 1.8s ease-in-out infinite;
+}
+
+.run-node-beacon {
+  animation: runpulse 1.2s ease-in-out infinite;
+}
+
+.run-graph-node:focus {
+  outline: none;
+}
+
+.run-graph-node:focus > rect:first-of-type {
+  stroke: var(--color-accent-hi);
+  stroke-width: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .run-node-pulse,
+  .run-node-beacon {
+    animation: none;
+    opacity: 0.45;
+  }
+}
+
+/* ---- Claude bot mascot ---- */
+@keyframes bot-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-1.5px);
+  }
+}
+@keyframes bot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
+}
+@keyframes bot-blink {
+  0%,
+  46%,
+  54%,
+  100% {
+    transform: scaleY(1);
+  }
+  50% {
+    transform: scaleY(0.12);
+  }
+}
+@keyframes bot-dot {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  50% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+.bot-eyes {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* hide scrollbars on the horizontal kanban / tab strip */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* markdown (reports, ticket bodies) */
+.prose-ns {
+  font-size: 14.5px;
+  line-height: 1.62;
+  color: var(--color-ink);
+  word-break: break-word;
+}
+.prose-ns > :first-child {
+  margin-top: 0;
+}
+.prose-ns h1,
+.prose-ns h2,
+.prose-ns h3,
+.prose-ns h4,
+.prose-ns h5,
+.prose-ns h6 {
+  font-family: var(--font-head);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  margin: 20px 0 8px;
+}
+.prose-ns h1 {
+  font-size: 20px;
+}
+.prose-ns h2 {
+  font-size: 17px;
+}
+.prose-ns h3 {
+  font-size: 15.5px;
+}
+.prose-ns p {
+  margin: 10px 0;
+}
+.prose-ns ul,
+.prose-ns ol {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+.prose-ns li {
+  margin: 4px 0;
+}
+.prose-ns ul {
+  list-style: disc;
+}
+.prose-ns ol {
+  list-style: decimal;
+}
+.prose-ns a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose-ns strong {
+  color: var(--color-ink);
+  font-weight: 700;
+}
+.prose-ns code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--color-raise);
+  padding: 1px 5px;
+}
+.prose-ns pre {
+  background: var(--color-bg);
+  border: 1px solid var(--color-line);
+  padding: 14px;
+  overflow: auto;
+  margin: 12px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: #c4c8d0;
+}
+.prose-ns pre code {
+  background: none;
+  padding: 0;
+}
+.prose-ns blockquote {
+  border-left: 2px solid var(--color-line2);
+  padding-left: 12px;
+  margin: 12px 0;
+  color: var(--color-mut);
+}
+.prose-ns hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 18px 0;
+}
+.prose-ns table {
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 13px;
+  width: 100%;
+}
+.prose-ns th,
+.prose-ns td {
+  border: 1px solid var(--color-line);
+  padding: 6px 10px;
+  text-align: left;
+}
+.prose-ns th {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-mut);
+}
+/* ADR-0020: one graph language for templates, scheduled night runs, and live runs. */
+.flow-graph {
+  height: min(62vh, 620px);
+  min-height: 420px;
+  /* An explicit width + min-width:0 stops react-flow's intrinsic size from
+     forcing its (grid/flex) parent wider than the viewport on mobile — the
+     canvas pans/zooms internally, so it never needs to grow the page. */
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--color-line);
+  background: var(--color-bg);
+  touch-action: none;
+  /* Anchor for the insert picker + fullscreen overlay. */
+  position: relative;
+}
+/* In-form preview (create run): shorter canvas so the form stays scannable. */
+.flow-graph.compact {
+  height: min(44vh, 440px);
+  min-height: 300px;
+}
+.flow-graph-node {
+  width: 176px;
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--color-line2);
+  background: var(--color-surface);
+  padding: 10px;
+  color: var(--color-ink);
+  box-shadow: 0 8px 20px #0005;
+}
+.flow-graph-node small {
+  display: block;
+  margin-top: 3px;
+  color: var(--color-dim);
+  font: 9px/1.2 var(--font-mono);
+  text-transform: uppercase;
+}
+.flow-graph-node small.flow-graph-verdict {
+  color: var(--color-mut);
+  letter-spacing: 0.03em;
+}
+/* ADR-0023: emission budget (template) / emitted-at-runtime (run) — the accent
+   marks the one line on the card that says the shape can still change. */
+.flow-graph-node small.flow-graph-emits {
+  color: var(--color-accent);
+  letter-spacing: 0.03em;
+}
+/* Member slot of a compared pair: same role, same prompt, different pin. */
+.flow-graph-slot {
+  font: 10px/1 var(--font-mono);
+  font-style: normal;
+  color: var(--color-accent);
+}
+.flow-graph-node.route {
+  border-style: dashed;
+  border-color: var(--color-sched);
+}
+/* A node the RUN created, not the automation: dashed like a route node, accented
+   because it is part of the happy path the run chose for itself (ADR-0023). */
+.flow-graph-node.emitted {
+  border-style: dashed;
+  border-color: var(--color-accent);
+}
+.flow-graph-node.running {
+  border-color: var(--color-accent);
+}
+.flow-graph-node.delivered {
+  border-color: var(--color-ok);
+}
+.flow-graph-node.invalid {
+  border-color: var(--color-danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-danger) 35%, transparent);
+}
+.flow-graph-node.selected {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 40%, transparent);
+}
+.react-flow__edge.needs-work path {
+  stroke: var(--color-sched);
+  stroke-dasharray: 7 5;
+}
+.react-flow__edge.invalid path {
+  stroke: var(--color-danger);
+  stroke-width: 3;
+}
+.react-flow__edge-text {
+  fill: var(--color-sched);
+  font-size: 10px;
+}
+/* Fullscreen expand: a CSS overlay, not the Fullscreen API — iPhones don't
+   support the API for non-video elements and this app is phone-first. Above the
+   app chrome (nav z-30) and modals (z-50). */
+.flow-graph.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  height: 100dvh;
+  min-height: 100dvh;
+  border: none;
+}
+.graph-fab {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--color-line2);
+  background: var(--color-surface);
+  color: var(--color-ink);
+}
+.graph-fab:hover {
+  border-color: var(--color-accent);
+}
+.graph-toolbar {
+  display: flex;
+  gap: 4px;
+}
+.graph-toolbar button {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--color-line2);
+  background: var(--color-raise);
+  color: var(--color-ink);
+}
+.graph-toolbar button:hover {
+  border-color: var(--color-accent);
+}
+.graph-toolbar button.danger:hover {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+.graph-issues {
+  max-width: min(70vw, 560px);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 60%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 12%, var(--color-bg));
+  color: var(--color-danger);
+  padding: 8px 12px;
+  font: 11px/1.4 var(--font-mono);
+}
+.graph-detail {
+  width: min(340px, calc(100vw - 24px));
+  max-height: 60dvh;
+  overflow-y: auto;
+  border: 1px solid var(--color-line2);
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  backdrop-filter: blur(4px);
+  padding: 12px;
+}
+.graph-palette-wrap {
+  max-width: min(92vw, 880px);
+}
+.graph-hints {
+  display: none;
+  margin-bottom: 6px;
+  color: var(--color-dim);
+  font: 9.5px/1.3 var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-align: center;
+}
+.graph-palette {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--color-line2);
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  backdrop-filter: blur(4px);
+  padding: 8px;
+}
+.graph-palette button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  min-height: 40px;
+  border: 1px solid var(--color-line2);
+  background: var(--color-bg);
+  color: var(--color-ink);
+  padding: 0 10px;
+  font-size: 11px;
+}
+.graph-palette button:hover {
+  border-color: var(--color-accent);
+}
+.graph-picker {
+  position: absolute;
+  z-index: 20;
+  width: 240px;
+  border: 1px solid var(--color-line2);
+  background: var(--color-raise);
+  box-shadow: 0 12px 32px #000a;
+}
+.graph-picker input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--color-line);
+  background: var(--color-bg);
+  color: var(--color-ink);
+  padding: 10px 12px;
+  font: 12px var(--font-sans);
+}
+.graph-picker-list {
+  max-height: 240px;
+  overflow-y: auto;
+}
+.graph-picker-list button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 40px;
+  padding: 6px 12px;
+  text-align: left;
+  font-size: 12px;
+}
+.graph-picker-list button:hover {
+  background: var(--color-surface);
+}
+.graph-picker-list button small {
+  display: block;
+  color: var(--color-dim);
+  font: 9px/1.2 var(--font-mono);
+  text-transform: uppercase;
+}
+.graph-picker-list p {
+  padding: 10px 12px;
+  color: var(--color-dim);
+  font-size: 11px;
+}
+/* Run overlay: the path actually taken reads at a glance. */
+.react-flow__edge.traveled path {
+  stroke: var(--color-ok);
+}
+.react-flow__minimap {
+  background: var(--color-bg2);
+  border: 1px solid var(--color-line);
+}
+.react-flow__minimap-mask {
+  fill: #0a0b0ccc;
+}
+.react-flow__minimap-node {
+  fill: var(--color-line2);
+}
+@media (max-width: 640px) {
+  .flow-graph {
+    height: 58dvh;
+    min-height: 430px;
+  }
+  .flow-graph-node {
+    width: 160px;
+    min-height: 68px;
+  }
+  .react-flow__controls button {
+    width: 44px;
+    height: 44px;
+  }
+}
+@media (min-width: 641px) {
+  .graph-hints {
+    display: block;
+  }
+}

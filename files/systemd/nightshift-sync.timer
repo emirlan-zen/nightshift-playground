@@ -1,0 +1,12 @@
+[Unit]
+Description=nightshift prompt sync every 15 minutes
+
+[Timer]
+OnCalendar=*:00/15
+# catch up after a reboot/downtime instead of silently missing a window
+Persistent=true
+# smear the start so a sync never lands on the exact second a wave launches
+RandomizedDelaySec=45
+
+[Install]
+WantedBy=timers.target

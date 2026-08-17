@@ -1,0 +1,46 @@
+#cloud-config
+# Lean bootstrap: install git, clone the nightshift repo, hand off to install.sh.
+# All real logic lives in bootstrap/install.sh (committed, so no TF/bash brace clashes).
+
+timezone: ${timezone}
+
+# No sudo group and no sudo: rule — the agent user runs unattended Claude
+# sessions under bypassPermissions; its ONLY privilege is the scoped
+# /etc/sudoers.d/nightshift-control entry install.sh writes (nightshift-rc).
+# Operator root access is root@ SSH. (docker group stays: preview hosting
+# needs it, an accepted root-equivalent documented in SECURITY.md.)
+users:
+  - name: ${agent_user}
+    groups: [docker]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+write_files:
+  - path: /etc/nightshift/nightshift.env
+    permissions: '0644'
+    content: |
+      AGENT_USER=${agent_user}
+      PREVIEW_DOMAIN=${preview_domain}
+      ACME_EMAIL=${acme_email}
+      GO_VERSION=${go_version}
+      NODE_MAJOR=${node_major}
+      SKILLS_REPO_REF=${skills_repo_ref}
+      TERRAFORM_VERSION=${terraform_version}
+      NIGHTSHIFT_REPO_URL=${nightshift_repo_url}
+
+package_update: true
+packages:
+  - git
+  - curl
+  - jq
+  - ca-certificates
+
+runcmd:
+  - mkdir -p /etc/nightshift/secrets
+  - chmod 700 /etc/nightshift/secrets
+  - chown ${agent_user}:${agent_user} /etc/nightshift/secrets
+  # nightshift is a PRIVATE repo. We do NOT clone it here (a boot token would land
+  # in Terraform state). The operator clones it with the GitHub PAT during setup,
+  # then runs install.sh. See 'terraform output next_steps'.
+  - "echo 'cloud-init base done; deliver PAT, clone nightshift, run install.sh' | tee /var/log/nightshift-install.log"

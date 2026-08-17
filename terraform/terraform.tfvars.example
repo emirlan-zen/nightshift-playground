@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars (gitignored) and replace every placeholder.
+
+hcloud_token = "REPLACE_ME"
+
+preview_domain = "night.example.com"
+acme_email     = "you@example.com"
+
+server_name         = "nightshift-playground"
+server_type         = "cpx41"
+location            = "hel1"
+hcloud_ssh_key_name = "REPLACE_ME"
+ssh_public_key      = "ssh-ed25519 REPLACE_ME you@host"
+ssh_allowed_ips     = ["REPLACE_ME/32"]
+
+# URL of this sanitized repository. Public HTTPS is simplest. For a private
+# repository, clone it manually during the post-provision setup.
+nightshift_repo_url = "https://github.com/REPLACE_ME/nightshift-playground.git"
+
+timezone        = "UTC"
+skills_repo_ref = "main"

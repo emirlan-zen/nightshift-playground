@@ -1,0 +1,18 @@
+# install.sh replaces __PREVIEW_DOMAIN__ while staging this file on the VM.
+http:
+  routers:
+    control:
+      rule: "Host(`control.__PREVIEW_DOMAIN__`)"
+      entryPoints: [websecure]
+      service: control
+      tls: {}
+  services:
+    control:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8787"
+
+tls:
+  certificates:
+    - certFile: /certs/control.__PREVIEW_DOMAIN__.pem
+      keyFile: /certs/control.__PREVIEW_DOMAIN__.key

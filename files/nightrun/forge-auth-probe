@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Forge-token pre-flight probe. Installed as /usr/local/bin/forge-auth-probe.
+#
+#   forge-auth-probe <company>
+#
+# Checks the playground GitHub token with one real
+# API call, so a night wave learns BEFORE burning its window that pushes/PRs
+# will fail. Companion to claude-auth-probe, but a dead
+# forge token never skips a wave: analysis work still functions.
+#
+# Exit codes:
+#   0 = token works (authed API call succeeded)
+#   2 = token DEAD (API answered 401/403)
+#   3 = no token configured for this company (n/a — not a failure)
+#   4 = network error / inconclusive (fail OPEN — never punish a healthy
+#       night for an API blip)
+#   1 = usage / bad company
+#
+# Prints one line of JSON: {"company":"...","ok":true|false,"detail":"...","checked_at":"..."}
+# and writes the same JSON (rename-atomic) to ~/.nightshift/health/forge-<company>.json
+# so the control plane can surface it. "ok" is false ONLY on a confirmed-dead
+# token (exit 2); n/a and inconclusive report ok=true with the reason in detail.
+set -euo pipefail
+
+company="${1:?usage: forge-auth-probe playground}"
+# also guards the health-file path — company is user input here
+[[ "$company" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "forge-auth-probe: bad company '${company}'" >&2; exit 1; }
+[[ "$company" == "playground" ]] || { echo "forge-auth-probe: refusing unknown agent '${company}'" >&2; exit 1; }
+
+# Prefer the company's own secrets file; fall back to ambient env (systemd
+# units already load the per-company EnvironmentFile, and the agent user can't
+# read /etc/nightshift/secrets directly).
+envfile="/etc/nightshift/secrets/${company}.env"
+if [[ -r "$envfile" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$envfile"
+  set +a
+fi
+
+timeout_s="${FORGE_AUTH_PROBE_TIMEOUT:-10}"
+
+emit() { # emit <exit-code> <ok:true|false> <detail>
+  local rc="$1" ok="$2" detail="$3"
+  local ts json dir tmp
+  ts="$(date -Is 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  # detail is machine-generated below (no quotes/backslashes), but strip any anyway
+  detail="${detail//\\/}"; detail="${detail//\"/}"
+  json="$(printf '{"company":"%s","ok":%s,"detail":"%s","checked_at":"%s"}' \
+    "$company" "$ok" "$detail" "$ts")"
+  echo "$json"
+  dir="${HOME}/.nightshift/health"
+  # best-effort persistence: the probe's verdict must never be lost to a
+  # read-only HOME or a full disk — the exit code + stdout still carry it
+  if mkdir -p "$dir" 2>/dev/null; then
+    tmp="${dir}/.forge-${company}.json.tmp.$$"
+    if printf '%s\n' "$json" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "${dir}/forge-${company}.json" 2>/dev/null || rm -f "$tmp"
+    fi
+  fi
+  exit "$rc"
+}
+
+token="${GH_TOKEN:-}"
+[[ -n "$token" ]] || emit 3 true "no GH_TOKEN configured (n/a)"
+url="https://api.github.com/user"
+auth_header="Authorization: token ${token}"
+forge="github"
+
+# `rc=0; out="$(cmd)" || rc=$?` — NOT `out=$(cmd); rc=$?`: under set -e a failing
+# command substitution in a plain assignment kills the script before rc is read
+# (the launcher auth-skip dead-code bug, 2026-07-06).
+crc=0
+code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$timeout_s" \
+        -H "$auth_header" "$url" 2>/dev/null)" || crc=$?
+
+if [[ $crc -ne 0 || ! "$code" =~ ^[0-9]{3}$ || "$code" == "000" ]]; then
+  emit 4 true "${forge} probe inconclusive (curl rc=${crc}, http=${code:-none}) — failing open"
+fi
+case "$code" in
+  2??)     emit 0 true  "${forge} token ok (http ${code})" ;;
+  401|403) emit 2 false "${forge} token DEAD (http ${code}) — pushes/PRs will fail" ;;
+  *)       emit 4 true  "${forge} probe inconclusive (http ${code}) — failing open" ;;
+esac

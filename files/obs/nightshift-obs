@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Agent-side read-only view of the observability store (ADR-0006). Installed as
+# /usr/local/bin/nightshift-obs. Lets a night agent — especially the synth wave —
+# read FACTS about the night (which waves ran, delivered, stalled, or looped)
+# instead of guessing from which report files happen to exist. The 2026-07-04
+# silent night's synth wave concluded "the scheduler is broken"; it wasn't —
+# Claude auth had died. This CLI is the fix.
+#
+# The store is ~/.nightshift/observability.db (SQLite, WAL). We open it READ-ONLY
+# and scope every query to the agent whose workspace you're in — fails closed
+# outside ~/workspace/<agent>/, like the jira/gcloud/ticket wrappers.
+#
+#   nightshift-obs stalls              # open alerts for this agent (loop/storm/stall/no-deliverable/limit-hit)
+#   nightshift-obs night [YYYY-MM-DD]  # night ledger: runs + delivered/skip/no-deliverable status
+#   nightshift-obs session <uuid>      # one session's turns / tool calls / errors
+#   nightshift-obs errors              # recent sessions with a high tool-error rate
+#   nightshift-obs usage               # tonight's API-$ spend by agent vs budget + trailing-7-day total
+#
+# Exit codes: 0 ok, 2 refused (outside workspace / bad id), 1 error.
+set -euo pipefail
+
+ws="${HOME}/workspace"; agent=""
+case "${PWD}/" in "${ws}"/*) agent="${PWD#${ws}/}"; agent="${agent%%/*}";; esac
+if [ -z "$agent" ]; then
+  echo "nightshift-obs: refusing — run inside ~/workspace/<agent>/ (cwd=${PWD})" >&2
+  exit 2
+fi
+db="${HOME}/.nightshift/observability.db"
+if [ ! -f "$db" ]; then echo "nightshift-obs: no store yet ($db)" >&2; exit 1; fi
+
+cmd="${1:-stalls}"; arg="${2:-}"
+
+case "$cmd" in
+  session)
+    [[ "$arg" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "nightshift-obs: bad session id" >&2; exit 2; }
+    ;;
+  stalls|night|errors|usage) : ;;
+  *) echo "usage: nightshift-obs stalls|night [date]|session <id>|errors|usage" >&2; exit 2 ;;
+esac
+
+exec python3 - "$db" "$agent" "$cmd" "$arg" <<'PY'
+import sqlite3, sys, time
+db_path, agent, cmd, arg = sys.argv[1:5]
+db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+now = int(time.time())
+
+def fmt_age(ts):
+    if not ts: return "?"
+    s = now - int(ts)
+    if s < 3600: return f"{s//60}m ago"
+    if s < 86400: return f"{s//3600}h ago"
+    return f"{s//86400}d ago"
+
+if cmd == "stalls":
+    rows = db.execute(
+        "SELECT kind, COALESCE(detail,''), COALESCE(run_id,''), COALESCE(session_id,''), ts "
+        "FROM alerts WHERE cleared=0 AND agent=? ORDER BY ts DESC LIMIT 50", (agent,)).fetchall()
+    if not rows:
+        print(f"{agent}: no open alerts."); sys.exit(0)
+    print(f"{agent}: {len(rows)} open alert(s)")
+    for kind, detail, rid, sid, ts in rows:
+        who = rid or sid or "-"
+        print(f"  [{kind}] {detail}  ({who}, {fmt_age(ts)})")
+
+elif cmd == "night":
+    if arg:  # a calendar date: runs started that Bishkek day
+        import datetime, os
+        os.environ["TZ"] = "Asia/Bishkek"; time.tzset()
+        try:
+            d = datetime.datetime.strptime(arg, "%Y-%m-%d")
+        except ValueError:
+            print("bad date, want YYYY-MM-DD", file=sys.stderr); sys.exit(2)
+        lo = int(time.mktime((d - datetime.timedelta(hours=4)).timetuple()))
+        hi = int(time.mktime((d + datetime.timedelta(days=1)).timetuple()))
+    else:    # default: the last 14h (covers a 23:00 -> morning pipeline)
+        lo, hi = now - 14*3600, now + 3600
+    rows = db.execute(
+        "SELECT run_id, COALESCE(label,''), COALESCE(started,0), report "
+        "FROM runs WHERE agent=? AND started>=? AND started<? ORDER BY started", (agent, lo, hi)).fetchall()
+    if not rows:
+        print(f"{agent}: no runs in window."); sys.exit(0)
+    # alerts keyed by run for annotation
+    al = {}
+    for rid, kind in db.execute("SELECT run_id, kind FROM alerts WHERE cleared=0 AND agent=? AND run_id!=''", (agent,)):
+        al.setdefault(rid, []).append(kind)
+    print(f"{agent}: {len(rows)} run(s)")
+    for rid, label, started, report in rows:
+        if report: status = "delivered"
+        elif rid in al and "no-deliverable" in al[rid]: status = "NO-DELIVERABLE"
+        else: status = "ran (no report)"
+        tags = (" +" + ",".join(al[rid])) if rid in al else ""
+        print(f"  {label or rid:<22} {status:<16} {fmt_age(started)}{tags}")
+
+elif cmd == "session":
+    r = db.execute(
+        "SELECT turns, tool_calls, tool_errors, first_ts, last_ts, COALESCE(model,'') "
+        "FROM sessions WHERE session_id=? AND agent=?", (arg, agent)).fetchone()
+    if not r:
+        print(f"{agent}: no such session {arg}"); sys.exit(0)
+    turns, calls, errs, first, last, model = r
+    print(f"session {arg} ({agent})")
+    print(f"  model={model} turns={turns} tool_calls={calls} tool_errors={errs}")
+    print(f"  first={fmt_age(first)} last={fmt_age(last)}")
+    top = db.execute(
+        "SELECT tool, COUNT(*), SUM(is_error) FROM tool_calls WHERE session_id=? GROUP BY tool ORDER BY 2 DESC LIMIT 8",
+        (arg,)).fetchall()
+    if top:
+        print("  tools: " + ", ".join(f"{t}={c}({e or 0}err)" for t, c, e in top))
+
+elif cmd == "errors":
+    rows = db.execute(
+        "SELECT session_id, tool_calls, tool_errors, last_ts FROM sessions "
+        "WHERE agent=? AND tool_calls>=5 AND tool_errors*3>=tool_calls AND last_ts>? "
+        "ORDER BY last_ts DESC LIMIT 20", (agent, now-14*86400)).fetchall()
+    if not rows:
+        print(f"{agent}: no high-error sessions."); sys.exit(0)
+    print(f"{agent}: sessions with high tool-error rate")
+    for sid, calls, errs, last in rows:
+        print(f"  {sid}  {errs}/{calls} errored  ({fmt_age(last)})")
+
+elif cmd == "usage":
+    # API-equivalent $ spend, box-wide. Opus (and any unknown model,
+    # conservatively) $15/$75/$18.75/$1.50 per M for in/out/cache-write/
+    # cache-read; haiku $1/$5/$1.25/$0.10. Metadata only.
+    # RATES below must match the canonical table in control/ (see costTable) —
+    # this CLI and the Go governor must price identically; update together.
+    import os, datetime, json as _json
+    def cost(model, i, o, cw, cr):
+        r = (1.0, 5.0, 1.25, 0.10) if "haiku" in (model or "").lower() else (15.0, 75.0, 18.75, 1.50)
+        return (i*r[0] + o*r[1] + cw*r[2] + cr*r[3]) / 1e6
+    # night boundary = Bishkek 22:30 of the night in question.
+    os.environ["TZ"] = "Asia/Bishkek"; time.tzset()
+    n = datetime.datetime.now()
+    anchor = n.replace(hour=22, minute=30, second=0, microsecond=0)
+    if n < anchor:
+        anchor -= datetime.timedelta(days=1)
+    night_start = int(time.mktime(anchor.timetuple()))
+    # budget from ~/.nightshift/config.json (not in the DB); 0/absent -> default 1800.
+    budget = 1800.0
+    try:
+        cfg = _json.load(open(os.path.expanduser("~/.nightshift/config.json")))
+        b = cfg.get("nightBudgetUSD") or 0
+        if b and float(b) > 0:
+            budget = float(b)
+    except Exception:
+        pass
+    per = {}
+    for ag, model, i, o, cw, cr in db.execute(
+        "SELECT s.agent, COALESCE(t.model,''), t.in_tokens, t.out_tokens, t.cache_create, t.cache_read "
+        "FROM turns t JOIN sessions s ON s.session_id=t.session_id WHERE t.ts>=?", (night_start,)):
+        per[ag] = per.get(ag, 0.0) + cost(model, i, o, cw, cr)
+    total = sum(per.values())
+    week = 0.0
+    for model, i, o, cw, cr in db.execute(
+        "SELECT COALESCE(model,''), in_tokens, out_tokens, cache_create, cache_read "
+        "FROM turns WHERE ts>=?", (now - 7*86400,)):
+        week += cost(model, i, o, cw, cr)
+    pct = (100.0 * total / budget) if budget > 0 else 0.0
+    print(f"tonight (since 22:30): ${total:,.0f} of ${budget:,.0f} budget ({pct:.0f}%)")
+    for ag in sorted(per, key=lambda a: -per[a]):
+        print(f"  {ag:<14} ${per[ag]:,.0f}")
+    print(f"last 7 days: ${week:,.0f}")
+PY

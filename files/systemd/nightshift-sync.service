@@ -1,0 +1,10 @@
+[Unit]
+Description=nightshift prompt sync (ff-only pull of /opt/nightshift + re-copy prompts; never rebuilds binaries or restarts services)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The script sources /etc/nightshift/nightshift.env + secrets itself (set -a
+# sourcing, not Environment= — no whitespace-quoting trap to fall into).
+ExecStart=/usr/local/bin/nightshift-sync

@@ -1,0 +1,13 @@
+# Build-script policy. esbuild's native binary must build; msw ships a
+# postinstall we deliberately DON'T run (its service-worker isn't used — the
+# tests import msw/node). Declaring msw:false records that decision, so pnpm's
+# verify-deps-before-run — which the box enforces on every `pnpm <script>` —
+# treats it as resolved instead of raising ERR_PNPM_IGNORED_BUILDS. That makes
+# the documented `pnpm typecheck|lint|test` commands work directly (no .bin
+# bypass) and keeps this file clean (pnpm no longer appends a pending-decision
+# placeholder). Keep in sync with onlyBuiltDependencies below.
+allowBuilds:
+  esbuild: true
+  msw: false
+onlyBuiltDependencies:
+  - esbuild

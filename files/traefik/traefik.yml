@@ -1,0 +1,36 @@
+# Traefik static config. Docker provider + per-host certs via TLS-ALPN-01.
+# No DNS provider / no Cloudflare token needed: each preview host gets its own
+# cert on first request, validated on :443. Requires the host to resolve to this
+# box (wildcard A record *.<preview_domain> -> IP, set manually).
+api:
+  dashboard: true
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "tcp://dockerproxy:2375"   # via nginx version-rewrite sidecar
+    exposedByDefault: false              # only containers with traefik.enable=true are routed
+    network: web
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  le:
+    acme:
+      email: __ACME_EMAIL__
+      storage: /letsencrypt/acme.json
+      tlsChallenge: {}
+
+log:
+  level: INFO

@@ -1,0 +1,29 @@
+[Unit]
+Description=nightshift control plane (on-demand remote-control start/stop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__AGENT_USER__
+Environment=HOME=__AGENT_HOME__
+Environment=LISTEN=0.0.0.0:8787
+Environment=LOG_FORMAT=json
+Environment=LOG_LEVEL=info
+Environment="COMPANIES=playground"
+# control.env (Cloudflare Access): ACCESS_TEAM_DOMAIN (required) + ALLOWED_EMAILS
+# (recommended allowlist). ACCESS_AUD optional (extra per-app check). Without
+# ACCESS_TEAM_DOMAIN the app fails closed (refuses every request).
+EnvironmentFile=-/etc/nightshift/secrets/control.env
+ExecStart=/usr/local/bin/nightshift-control
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nightshift-control
+Restart=always
+RestartSec=5
+# hardening: it only needs to exec `sudo nightshift-rc`
+NoNewPrivileges=false
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

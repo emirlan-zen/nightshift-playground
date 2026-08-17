@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Active Claude Code auth pre-flight probe (ADR-0006).
+#
+# Exit 0  = authenticated (a real authed call succeeded).
+# Exit !=0 = NOT usable; a one-line reason is printed to stdout.
+#   2 = not authenticated (Claude says "Not logged in" / login required)
+#   3 = no credentials file at all
+#   other = probe error (timeout, missing binary, network)
+#
+# Why an ACTIVE probe and not a disk check: access tokens are short-lived and
+# refreshed on launch, so `expiresAt > now` false-positives nightly; and on the
+# 2026-07-04 silent night the creds looked fine on disk at 23:00 (Claude only
+# quarantined them to .broken-* at 06:43, AFTER the failures began). The only
+# signal that actually catches it is attempting a minimal authenticated call.
+#
+# Shared by nightshift-run-launcher (pre-flight: skip doomed waves) and the
+# control plane (auth-health for the page) so both judge auth the same way.
+# Auth is per-user (~/.claude), not per-workspace, but `claude -p` needs a
+# trusted cwd — cd to one (arg 1, default playground's workspace).
+set -uo pipefail
+
+probe_dir="${1:-$HOME/workspace/playground}"
+model="${CLAUDE_AUTH_PROBE_MODEL:-claude-haiku-4-5-20251001}"
+timeout_s="${CLAUDE_AUTH_PROBE_TIMEOUT:-45}"
+
+cd "$probe_dir" 2>/dev/null || cd "$HOME" || exit 4
+
+creds="$HOME/.claude/.credentials.json"
+[[ -f "$creds" ]] || { echo "no credentials.json"; exit 3; }
+
+claude_bin="$(command -v claude || true)"
+[[ -n "$claude_bin" ]] || { echo "claude binary not found on PATH"; exit 5; }
+
+# Serialize the authed call across EVERY probe caller — launcher pre-flights AND
+# the control plane's 10-minute health ticker. The call refreshes an expired
+# OAuth token, and concurrent refreshes tear ~/.claude/.credentials.json (the
+# 2026-07-05 whole-night logout). The lock lives HERE, not in the callers, so
+# nobody can probe unserialized. Best-effort (300s cap), and separate from the
+# auth verdict: a lock timeout is never mistaken for an auth failure.
+lock="${CLAUDE_AUTH_LOCK:-$HOME/.nightshift/claude-auth.lock}"
+exec 9>"$lock" 2>/dev/null && flock -w 300 9 2>/dev/null || true
+
+# -k 10: a claude that ignores SIGTERM would otherwise hold the lock forever.
+out="$(timeout -k 10 "$timeout_s" "$claude_bin" -p "Reply with only: OK" \
+        --model "$model" 2>&1)"
+rc=$?
+exec 9>&- 2>/dev/null || true
+
+# The positive signal is "the authed call completed", NOT the reply content —
+# a small model may ramble past a one-word instruction, and that is still proof
+# auth works. Only an explicit auth-failure string (which can surface with a
+# zero OR non-zero exit) or a non-zero exit means not-usable.
+if grep -qiE 'not logged in|please run /login|invalid api key|unauthor|token (has )?expired' <<<"$out"; then
+  echo "not authenticated ($(printf '%s' "${out//$'\n'/ }" | cut -c1-160))"
+  exit 2
+fi
+if [[ $rc -ne 0 ]]; then
+  echo "probe failed (rc=${rc}): $(head -1 <<<"$out")"
+  exit "$rc"
+fi
+echo "ok"
+exit 0
